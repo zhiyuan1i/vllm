@@ -67,7 +67,20 @@ class TritonAttentionMetadataBuilder(
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
         self.device = device
-        self.block_size = kv_cache_spec.block_size
+        # Block size configuration for virtual splitting
+        self.physical_block_size = kv_cache_spec.block_size
+        # Use logical block size of 64 for better granularity while maintaining efficiency
+        self.logical_block_size = min(kv_cache_spec.block_size, 16)
+        
+        # Ensure physical block size is divisible by logical block size
+        if self.physical_block_size % self.logical_block_size != 0:
+            raise ValueError(
+                f"Physical block size {self.physical_block_size} must be divisible "
+                f"by logical block size {self.logical_block_size}")
+        
+        self.blocks_per_phys_block = self.physical_block_size // self.logical_block_size
+        # Use logical block size for attention computation
+        self.block_size = self.logical_block_size
         self.kv_cache_spec = kv_cache_spec
 
         model_config = vllm_config.model_config
@@ -101,6 +114,14 @@ class TritonAttentionMetadataBuilder(
         slot_mapping = common_attn_metadata.slot_mapping
 
         use_cascade = common_prefix_len > 0
+
+        # Split block table for logical block size if needed
+        if self.blocks_per_phys_block > 1:
+            block_table_tensor, seq_lens = self._split_block_table_and_seq_lens(
+                block_table_tensor, seq_lens)
+            seq_lens_cpu = seq_lens.cpu()
+            # Update max_seq_len to reflect logical blocks
+            max_seq_len = int(seq_lens_cpu.max())
 
         if use_cascade:
             cu_prefix_query_lens = torch.tensor([0, num_actual_tokens],

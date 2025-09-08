@@ -212,6 +212,63 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
         """
         raise NotImplementedError
 
+    def _split_block_table_and_seq_lens(self, phys_block_table: torch.Tensor, 
+                                       phys_seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Split physical block table and sequence lengths for logical block size.
+        
+        This implements virtual block splitting where each physical block is divided
+        into multiple logical blocks. Only non-empty logical blocks are returned
+        to optimize memory bandwidth during prefill/decode operations.
+        
+        Example:
+            phys_block_table: [[1, 3]] (physical blocks)
+            phys_seq_lens: [130] (physical sequence length in tokens)
+            physical_block_size: 1024, logical_block_size: 64
+            -> split_ratio: 16
+            -> needed_logic_blocks: [3] (only 3 logical blocks needed for 130 tokens)
+            -> logic_block_table: [[16, 17, 18]] (only non-empty blocks)
+            -> logic_seq_lens: [130] (unchanged, but now refers to logical positions)
+        
+        Args:
+            phys_block_table: Physical block table [batch_size, num_phys_blocks]
+            phys_seq_lens: Physical sequence lengths [batch_size] in tokens
+            
+        Returns:
+            logic_block_table: Logical block table [batch_size, max_non_empty_blocks]
+            logic_seq_lens: Logical sequence lengths [batch_size] in logical positions
+        """
+        if self.blocks_per_phys_block == 1:
+            return phys_block_table, phys_seq_lens
+            
+        batch_size, num_phys_blocks = phys_block_table.shape
+        device = phys_block_table.device
+        phys_blocks_expanded = phys_block_table.unsqueeze(-1)  # [B, N, 1]
+        offset = torch.arange(self.blocks_per_phys_block, device=device, dtype=torch.int32)  # [split_ratio]
+        
+        logical_blocks_3d = phys_blocks_expanded * self.blocks_per_phys_block + offset.view(1, 1, -1)
+        
+        full_logic_block_table = logical_blocks_3d.view(batch_size, -1)
+        needed_logic_blocks = torch.div(phys_seq_lens + self.logical_block_size - 1, 
+                                       self.logical_block_size, rounding_mode='floor')
+        
+        max_needed_blocks = int(needed_logic_blocks.max().item())
+        total_logic_blocks = num_phys_blocks * self.blocks_per_phys_block
+        
+        if max_needed_blocks == total_logic_blocks:
+            return full_logic_block_table, phys_seq_lens
+
+        filtered_logic_block_table = torch.zeros(batch_size, max_needed_blocks, 
+                                               dtype=full_logic_block_table.dtype, device=device)
+        
+        for batch_idx in range(batch_size):
+            num_needed = needed_logic_blocks[batch_idx].item()
+            if num_needed > 0:
+                filtered_logic_block_table[batch_idx, :num_needed] = full_logic_block_table[batch_idx, :num_needed]
+        
+        # Sequence lengths remain the same in terms of tokens
+        return filtered_logic_block_table, phys_seq_lens
+
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
         """
