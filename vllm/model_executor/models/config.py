@@ -387,7 +387,7 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
                 or cache_config.block_size < attn_block_size):
             cache_config.block_size = attn_block_size
             logger.info(
-                "Setting attention block size to %d tokens "
+                "Setting attention physical block size to %d tokens "
                 "to ensure that attention page size is >= mamba page size.",
                 attn_block_size)
 
