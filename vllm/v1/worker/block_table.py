@@ -313,7 +313,7 @@ class BlockTable:
             return physical_blocks
 
         # Create logical block IDs by splitting each physical block
-        logical_blocks = []
+        logical_blocks: list[int] = []
         for phys_block in physical_blocks:
             # Convert physical block to multiple logical blocks
             # Physical block 1 becomes logical blocks
