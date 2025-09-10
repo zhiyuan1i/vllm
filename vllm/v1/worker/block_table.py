@@ -29,6 +29,9 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
+        # Forward compatibility: maintain logical block size semantics
+        # for callers. When kernel_size is specified, use it as logical
+        # block size for backward compatibility
         self.block_size = kernel_size if kernel_size != 0 else block_size
         # Hybrid block table support
         if self.physical_block_size != self.block_size:
@@ -312,18 +315,13 @@ class BlockTable:
         # Create logical block IDs by splitting each physical block
         logical_blocks = []
         for phys_block in physical_blocks:
-            if phys_block == 0:  # Handle empty blocks (block 0 is always empty)
-                logical_blocks.append(0)
-            else:
-                # Convert physical block to multiple logical blocks
-                # Physical block 1 becomes logical blocks
-                # [1*split_ratio, 1*split_ratio+1, ...]
-                # But we need to account for the fact that block 0 is special
-                base_logical = (phys_block -
-                                1) * self.blocks_per_phys_block + 1
-                logical_blocks.extend(
-                    range(base_logical,
-                          base_logical + self.blocks_per_phys_block))
+            # Convert physical block to multiple logical blocks
+            # Physical block 1 becomes logical blocks
+            # [1*split_ratio, 1*split_ratio+1, ...]
+            # But we need to account for the fact that block 0 is special
+            base_logical = (phys_block - 1) * self.blocks_per_phys_block + 1
+            logical_blocks.extend(
+                range(base_logical, base_logical + self.blocks_per_phys_block))
 
         return np.array(logical_blocks, dtype=np.int32)
 
