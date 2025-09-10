@@ -55,41 +55,19 @@ class BlockTable:
         else:
             logical_table_size = max_num_blocks_per_req
 
-        # Unified block table: logical blocks in first section,
-        # physical blocks in second section
-        unified_table_size = logical_table_size + max_num_blocks_per_req
-        self.unified_block_table = torch.zeros(
-            (max_num_reqs, unified_table_size),
+        self.block_table = torch.zeros(
+            (max_num_reqs, logical_table_size),
             device=self.device,
             dtype=torch.int32,
         )
-        self.unified_block_table_cpu = torch.zeros(
-            (max_num_reqs, unified_table_size),
+        self.block_table_cpu = torch.zeros(
+            (max_num_reqs, logical_table_size),
             device="cpu",
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
-        self.unified_block_table_np = self.unified_block_table_cpu.numpy()
+        self.block_table_np = self.block_table_cpu.numpy()
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
-
-        # Create views for logical and physical sections
-        self.block_table = self.unified_block_table[:, :logical_table_size]
-        self.block_table_cpu = self.unified_block_table_cpu[:, :
-                                                            logical_table_size]
-        self.block_table_np = self.unified_block_table_np[:, :
-                                                          logical_table_size]
-
-        # Physical block table section
-        phys_start_idx = logical_table_size
-        phys_end_idx = logical_table_size + max_num_blocks_per_req
-        self.physical_block_table = self.unified_block_table[:, phys_start_idx:
-                                                             phys_end_idx]
-        self.physical_block_table_cpu = self.unified_block_table_cpu[:,
-                                                                     phys_start_idx:
-                                                                     phys_end_idx]
-        self.physical_block_table_np = self.unified_block_table_np[:,
-                                                                   phys_start_idx:
-                                                                   phys_end_idx]
 
         self.slot_mapping_cpu = torch.zeros(self.max_num_batched_tokens,
                                             dtype=torch.int64,
@@ -136,38 +114,15 @@ class BlockTable:
                                  f"[{start}:{start + logical_num}] > "
                                  f"{self.block_table_np.shape[1]}")
 
-            # Calculate physical start index BEFORE updating num_blocks_per_row
-            phys_start = self._get_physical_start_idx(row_idx)
-
+            # Store only logical blocks - no need for separate physical table
             self.block_table_np[row_idx,
                                 start:start + logical_num] = logical_blocks
             self.num_blocks_per_row[row_idx] += logical_num
-
-            self.physical_block_table_np[row_idx, phys_start:phys_start +
-                                         len(block_ids)] = block_ids
         else:
             num_blocks = len(block_ids)
             start = self.num_blocks_per_row[row_idx]
             self.num_blocks_per_row[row_idx] += num_blocks
             self.block_table_np[row_idx, start:start + num_blocks] = block_ids
-
-    def _get_physical_start_idx(self, row_idx: int) -> int:
-        """Calculate the start index for physical blocks in physical table."""
-        if not self.use_hybrid_blocks:
-            # In normal mode, physical and logical blocks are 1:1
-            return self.num_blocks_per_row[row_idx]
-
-        # In hybrid mode, count existing physical blocks by converting
-        # logical blocks
-        logical_count = self.num_blocks_per_row[row_idx]
-        if logical_count == 0:
-            return 0
-
-        # Convert existing logical blocks to physical blocks to count them
-        logical_blocks = self.block_table_np[row_idx, :logical_count]
-        physical_blocks = self._convert_logical_to_physical_blocks(
-            logical_blocks)
-        return len(physical_blocks)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -179,20 +134,6 @@ class BlockTable:
             src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
 
-        # Move physical blocks (always needed with unified tensor)
-        # Get physical block counts for both source and target
-        num_phys_blocks_src = self._get_physical_block_count(src)
-        num_phys_blocks_tgt = self._get_physical_block_count(tgt)
-
-        # Move physical blocks based on physical counts, not logical counts
-        self.physical_block_table_np[
-            tgt, :num_phys_blocks_src] = self.physical_block_table_np[
-                src, :num_phys_blocks_src]
-        # Clear remaining physical blocks in target row
-        if num_phys_blocks_src < num_phys_blocks_tgt:
-            self.physical_block_table_np[
-                tgt, num_phys_blocks_src:num_phys_blocks_tgt] = 0
-
     def swap_row(self, src: int, tgt: int) -> None:
         num_blocks_src = self.num_blocks_per_row[src]
         num_blocks_tgt = self.num_blocks_per_row[tgt]
@@ -200,12 +141,6 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks_src
 
         self.block_table_np[[src, tgt]] = self.block_table_np[[tgt, src]]
-
-        # Swap physical blocks (always needed with unified tensor)
-        self.physical_block_table_np[[src,
-                                      tgt]] = self.physical_block_table_np[[
-                                          tgt, src
-                                      ]]
 
     def compute_slot_mapping(self, req_indices: np.ndarray,
                              positions: np.ndarray) -> None:
@@ -279,9 +214,9 @@ class BlockTable:
                    out=self.slot_mapping_np[:req_indices.shape[0]])
 
     def commit_block_table(self, num_reqs: int) -> None:
-        # Commit unified block table (both logical and physical sections)
-        self.unified_block_table[:num_reqs].copy_(
-            self.unified_block_table_cpu[:num_reqs], non_blocking=True)
+        # Commit block table to device
+        self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
+                                          non_blocking=True)
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
         self.slot_mapping[:num_tokens].copy_(
@@ -289,8 +224,6 @@ class BlockTable:
 
     def _get_physical_block_count(self, row_idx: int) -> int:
         """Get the number of physical blocks for a request."""
-        # Always convert logical block count to physical block count
-        # since we now always have separate logical and physical sections
         logical_count = self.num_blocks_per_row[row_idx]
         if logical_count == 0:
             return 0
@@ -302,9 +235,8 @@ class BlockTable:
         return len(physical_blocks)
 
     def clear(self) -> None:
-        # Clear unified block table (both logical and physical sections)
-        self.unified_block_table.fill_(0)
-        self.unified_block_table_cpu.fill_(0)
+        self.block_table.fill_(0)
+        self.block_table_cpu.fill_(0)
 
     def _convert_physical_to_logical_blocks(
             self, physical_blocks: np.ndarray) -> np.ndarray:
