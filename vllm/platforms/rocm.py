@@ -324,7 +324,16 @@ class RocmPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
-            cache_config.block_size = 16
+            logic_block_size = 16
+        else:
+            logic_block_size = cache_config.block_size
+
+        if envs.VLLM_USE_V1:
+            cache_config.kernel_block_size = logic_block_size  # type: ignore
+            if cache_config.block_size is None:
+                cache_config.block_size = logic_block_size  # type: ignore
+        else:
+            cache_config.block_size = logic_block_size  # type: ignore
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
