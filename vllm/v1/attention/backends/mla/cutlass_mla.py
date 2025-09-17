@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Union
 
 import torch
 
 import vllm._custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionLayer, AttentionType,
+                                              MultipleOf,
                                               is_quantized_kv_cache)
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
@@ -38,6 +39,10 @@ class CutlassMLABackend(MLACommonBackend):
     @staticmethod
     def get_builder_cls() -> type["CutlassMLAMetadataBuilder"]:
         return CutlassMLAMetadataBuilder
+
+    @staticmethod
+    def get_supported_block_size() -> list[Union[int, MultipleOf]]:
+        return [128]
 
 
 class SM100Workspace:
@@ -210,9 +215,14 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
             sm_scale,
             num_kv_splits,
         )
-        returned_lse = lse[:, :H].contiguous(
-        ) if self.need_to_return_lse_for_decode else lse
-        return out[:, :H].contiguous(), returned_lse
+
+        if H < MAX_HEADS:
+            # Extract the subsets of the outputs
+            returned_lse = lse[:, :H].contiguous(
+            ) if self.need_to_return_lse_for_decode else lse
+            out = out[:, :H]
+
+        return out, returned_lse
 
     def _sm100_forward_decode(
         self,
@@ -228,11 +238,6 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         self._workspace.ensure_size(attn_metadata, self._num_kv_splits)
 
         # Run MLA
-        # Clone q_nope and q_pe to make sure strides computation is correct.
-        # TODO: Check if we really need it
-        q_nope = q_nope.clone()
-        q_pe = q_pe.clone()
-
         o, lse = self._sm100_cutlass_mla_decode(
             q_nope,
             q_pe,
